@@ -1,0 +1,11 @@
+{
+  "exchange": "krakenfutures",
+  "symbol": "BTC/USD:USD",
+  "timeframe": "1h",
+  "start_date_config": "2021-01-01",
+  "rows": 33878,
+  "first_ts": "2022-03-23 10:00:00+00:00",
+  "last_ts": "2026-02-01 23:00:00+00:00",
+  "build_time_utc": "2026-02-01T23:21:01.269979+00:00",
+  "canonical_path": "data_parquet/BTCUSD_USD_1h_20220323_now.parquet"
+}

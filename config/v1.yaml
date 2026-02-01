@@ -1,0 +1,28 @@
+exchange: krakenfutures
+symbol: "BTC/USD:USD"
+timeframe: "1h"
+
+start_date: "2021-01-01"
+
+fees:
+  taker: 0.0004
+  slippage_side: 0.0001
+
+position:
+  one_at_a_time: true
+  full_capital: true
+  leverage: 1
+
+rules:
+  entry: "next_open_after_signal"
+  exit: "next_open_on_opposite_signal"
+  stop_loss_pct: 0.02
+
+gates:
+  max_drawdown: 0.10
+  must_beat_baselines: true
+
+walkforward:
+  train: ["2021-01-01", "2022-12-31"]
+  validate: ["2023-01-01", "2023-12-31"]
+  test: ["2024-01-01", "now"]
