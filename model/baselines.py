@@ -1,18 +1,18 @@
 import pandas as pd
 
+def _ts_utc(df: pd.DataFrame) -> pd.DatetimeIndex:
+    ts = pd.to_datetime(df["ts"], utc=True)  # Simple, handles all cases
+    return pd.DatetimeIndex(ts, name="ts")
 
-def always_up(ts: pd.DatetimeIndex) -> pd.Series:
+def always_up(df: pd.DataFrame) -> pd.Series:
+    ts = _ts_utc(df)
     return pd.Series("up", index=ts, dtype="object")
 
-
-def yesterday_equals_today(close: pd.Series) -> pd.Series:
-    close = close.copy()
-    close.index = pd.to_datetime(close.index, utc=True)
-
+def yesterday_equals_today(df: pd.DataFrame) -> pd.Series:
+    ts = _ts_utc(df)
+    close = pd.to_numeric(df["close"], errors="coerce")
+    close.index = ts  # FIX: Align index before pct_change
     ret = close.pct_change()
-    sig = pd.Series(index=close.index, dtype="object")
-    sig[ret > 0] = "up"
-    sig[ret < 0] = "down"
-    sig[ret == 0] = "up"
-    sig = sig.fillna("up")
-    return sig
+    sig = pd.Series("up", index=ts, dtype="object")
+    sig.loc[ret < 0] = "down"
+    return sig.fillna("up")
