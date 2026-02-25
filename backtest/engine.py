@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
+
 import pandas as pd
 
 
 @dataclass(frozen=True)
 class EngineConfig:
-    fee_taker: float          # ex 0.0004
-    slippage_side: float      # ex 0.0001
-    stop_loss_pct: float      # ex 0.02
-    initial_equity: float     # 1.0 normalized
+    fee_taker: float
+    slippage_side: float
+    stop_loss_pct: float
+    initial_equity: float
     one_position: bool = True
 
 
@@ -23,7 +24,7 @@ def _apply_fill_price(direction: str, raw_price: float, slip: float) -> float:
         return raw_price * (1.0 - slip)
     if direction == "short_exit":
         return raw_price * (1.0 + slip)
-    raise ValueError("bad direction")
+    raise ValueError(f"bad direction: {direction}")
 
 
 def run_engine(
@@ -31,31 +32,28 @@ def run_engine(
     signals: pd.Series,
     cfg: EngineConfig,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
-
     required_cols = {"ts", "open", "high", "low", "close", "volume"}
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"df missing cols: {missing}")
 
-    df = df.sort_values("ts").reset_index(drop=True).copy()
+    df = df.copy()
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df = df.sort_values("ts").reset_index(drop=True)
 
     sig = signals.copy()
     if not isinstance(sig.index, pd.DatetimeIndex):
         raise ValueError("signals index must be DateTimeIndex aligned to df ts")
     sig.index = pd.to_datetime(sig.index, utc=True)
-    sig = sig.reindex(df["ts"]).fillna("flat")
+    sig = sig.reindex(df["ts"]).fillna("flat").astype("object")
 
     equity = float(cfg.initial_equity)
     peak = float(cfg.initial_equity)
 
-    position = "flat"  # flat | long | short
-    entry_px = None
-
-    pending_entry_side = None          # "long" | "short"
-    pending_entry_trade_idx = None     # int
-
-    pending_exit = False               # exit at next bar open
+    position: str = "flat"
+    entry_px: Optional[float] = None
+    entry_bar_idx: Optional[int] = None
+    active_trade_idx: Optional[int] = None
 
     trades: List[Dict[str, Any]] = []
     equity_rows: List[Dict[str, Any]] = []
@@ -64,241 +62,167 @@ def run_engine(
         nonlocal peak
         peak = max(peak, equity)
         dd = (peak - equity) / peak if peak > 0 else 0.0
-        equity_rows.append(
-            {"ts": ts_val, "equity": float(equity), "peak": float(peak), "drawdown": float(dd)}
+        equity_rows.append({"ts": ts_val, "equity": float(equity), "peak": float(peak), "drawdown": float(dd)})
+
+    def _new_trade(decision_ts: pd.Timestamp, side: str) -> int:
+        trades.append(
+            {
+                "decision_ts": decision_ts,
+                "side": side,
+                "entry_ts": None,
+                "entry_raw_px": None,
+                "entry_px": None,
+                "entry_bar_idx": None,
+                "equity_before_entry": None,
+                "fee_entry": 0.0,
+                "exit_ts": None,
+                "exit_raw_px": None,
+                "exit_px": None,
+                "exit_bar_idx": None,
+                "equity_after_exit": None,
+                "fee_exit": 0.0,
+                "exit_reason": None,
+                "gross_ret": None,
+                "fees_total": None,
+                "net_pnl_dollars": None,
+                "net_ret": None,
+                "bars_held": None,
+            }
         )
+        return len(trades) - 1
+
+    def finalize_trade(
+        trade_idx: int,
+        exit_bar_idx: int,
+        exit_ts: pd.Timestamp,
+        exit_raw_px: float,
+        exit_px_filled: float,
+        fee_exit: float,
+        exit_reason: str,
+        gross_ret: float,
+    ) -> None:
+        nonlocal equity
+        t = trades[trade_idx]
+        t["exit_ts"] = exit_ts
+        t["exit_raw_px"] = float(exit_raw_px)
+        t["exit_px"] = float(exit_px_filled)
+        t["exit_bar_idx"] = int(exit_bar_idx)
+        t["fee_exit"] = float(fee_exit)
+        t["exit_reason"] = exit_reason
+        t["equity_after_exit"] = float(equity)
+        t["gross_ret"] = float(gross_ret)
+
+        fees_total = float(t["fee_entry"]) + float(fee_exit)
+        t["fees_total"] = float(fees_total)
+
+        eq_before = float(t["equity_before_entry"]) if t["equity_before_entry"] is not None else 0.0
+        net_pnl = float(equity) - eq_before
+        t["net_pnl_dollars"] = float(net_pnl)
+        t["net_ret"] = float(net_pnl / eq_before) if eq_before > 0 else 0.0
+
+        if t["entry_bar_idx"] is not None:
+            t["bars_held"] = int(exit_bar_idx - int(t["entry_bar_idx"]))
 
     n = len(df)
 
     for i in range(n):
+        exited_this_bar = False
+
         ts = df.loc[i, "ts"]
         o = float(df.loc[i, "open"])
         h = float(df.loc[i, "high"])
         l = float(df.loc[i, "low"])
-        c = float(df.loc[i, "close"])
 
-        # 1) Execute pending entry at THIS bar open
-        if pending_entry_side is not None and position == "flat":
-            if pending_entry_trade_idx is None:
-                raise RuntimeError("pending entry has no trade index")
+        s = str(sig.iloc[i])
 
-            if pending_entry_side == "long":
-                fill_px = _apply_fill_price("long_entry", o, cfg.slippage_side)
-            else:
-                fill_px = _apply_fill_price("short_entry", o, cfg.slippage_side)
-
-            fee_entry = equity * float(cfg.fee_taker)
-            equity -= fee_entry
-
-            position = pending_entry_side
-            entry_px = fill_px
-
-            t = trades[pending_entry_trade_idx]
-            t["entry_px"] = float(fill_px)
-            t["fee_entry"] = float(fee_entry)
-
-            pending_entry_side = None
-            pending_entry_trade_idx = None
-
-        # 2) Execute pending exit at THIS bar open
-        if pending_exit and position in ("long", "short"):
-            if entry_px is None:
-                raise RuntimeError("exit attempted with no entry price")
-            if not trades:
-                raise RuntimeError("exit attempted with no trade record")
-
-            if position == "long":
-                exit_px = _apply_fill_price("long_exit", o, cfg.slippage_side)
-                gross_ret = (exit_px / entry_px) - 1.0
-            else:
-                exit_px = _apply_fill_price("short_exit", o, cfg.slippage_side)
-                gross_ret = (entry_px / exit_px) - 1.0
+        if position == "long" and s in ("down", "flat"):
+            exit_px = _apply_fill_price("long_exit", o, cfg.slippage_side)
+            gross_ret = (exit_px / float(entry_px)) - 1.0
 
             equity *= (1.0 + gross_ret)
-
             fee_exit = equity * float(cfg.fee_taker)
             equity -= fee_exit
 
-            trades[-1]["exit_ts"] = ts
-            trades[-1]["exit_px"] = float(exit_px)
-            trades[-1]["fee_exit"] = float(fee_exit)
-            trades[-1]["exit_reason"] = trades[-1]["exit_reason"] or "signal"
+            finalize_trade(active_trade_idx, i, ts, o, exit_px, fee_exit, "signal", gross_ret)
 
-            position = "flat"
-            entry_px = None
-            pending_exit = False
+            position, entry_px, entry_bar_idx, active_trade_idx = "flat", None, None, None
+            exited_this_bar = True
 
-        # 3) Intrabar stop check
-        if position == "long":
-            if entry_px is None:
-                raise RuntimeError("long position with no entry price")
-            stop_px = entry_px * (1.0 - float(cfg.stop_loss_pct))
-            if l <= stop_px:
-                if not trades:
-                    raise RuntimeError("stop attempted with no trade record")
+        elif position == "short" and s in ("up", "flat"):
+            exit_px = _apply_fill_price("short_exit", o, cfg.slippage_side)
+            gross_ret = (float(entry_px) / exit_px) - 1.0
 
-                stop_fill = stop_px * (1.0 - float(cfg.slippage_side))
-                gross_ret = (stop_fill / entry_px) - 1.0
-                equity *= (1.0 + gross_ret)
+            equity *= (1.0 + gross_ret)
+            fee_exit = equity * float(cfg.fee_taker)
+            equity -= fee_exit
 
-                fee_exit = equity * float(cfg.fee_taker)
-                equity -= fee_exit
+            finalize_trade(active_trade_idx, i, ts, o, exit_px, fee_exit, "signal", gross_ret)
 
-                trades[-1]["exit_ts"] = ts
-                trades[-1]["exit_px"] = float(stop_fill)
-                trades[-1]["fee_exit"] = float(fee_exit)
-                trades[-1]["exit_reason"] = "stop"
+            position, entry_px, entry_bar_idx, active_trade_idx = "flat", None, None, None
+            exited_this_bar = True
 
-                position = "flat"
-                entry_px = None
-                pending_exit = False
-
-        elif position == "short":
-            if entry_px is None:
-                raise RuntimeError("short position with no entry price")
-            stop_px = entry_px * (1.0 + float(cfg.stop_loss_pct))
-            if h >= stop_px:
-                if not trades:
-                    raise RuntimeError("stop attempted with no trade record")
-
-                stop_fill = stop_px * (1.0 + float(cfg.slippage_side))
-                gross_ret = (entry_px / stop_fill) - 1.0
-                equity *= (1.0 + gross_ret)
-
-                fee_exit = equity * float(cfg.fee_taker)
-                equity -= fee_exit
-
-                trades[-1]["exit_ts"] = ts
-                trades[-1]["exit_px"] = float(stop_fill)
-                trades[-1]["fee_exit"] = float(fee_exit)
-                trades[-1]["exit_reason"] = "stop"
-
-                position = "flat"
-                entry_px = None
-                pending_exit = False
-
-        # 4) Decide at bar close, schedule actions for next bar open
-        s = sig.iloc[i]
-        can_fill_next = (i + 1) < n
-
-        if position == "flat":
+        if position == "flat" and (not exited_this_bar):
             if s == "up":
-                pending_entry_side = "long"
-                trades.append(
-                    {
-                        "entry_ts": ts,
-                        "side": "long",
-                        "entry_px": None,
-                        "exit_ts": None,
-                        "exit_px": None,
-                        "exit_reason": None,
-                        "fee_entry": 0.0,
-                        "fee_exit": 0.0,
-                    }
-                )
-                pending_entry_trade_idx = len(trades) - 1
+                trade_idx = _new_trade(ts, "long")
+                t = trades[trade_idx]
+                t["equity_before_entry"] = float(equity)
+                t["entry_ts"] = ts
+                t["entry_raw_px"] = float(o)
+                t["entry_bar_idx"] = int(i)
 
-            elif s == "down":
-                pending_entry_side = "short"
-                trades.append(
-                    {
-                        "entry_ts": ts,
-                        "side": "short",
-                        "entry_px": None,
-                        "exit_ts": None,
-                        "exit_px": None,
-                        "exit_reason": None,
-                        "fee_entry": 0.0,
-                        "fee_exit": 0.0,
-                    }
-                )
-                pending_entry_trade_idx = len(trades) - 1
-
-            # FIX 4: Handle last bar / single bar case
-            if pending_entry_side is not None and not can_fill_next:
-                if pending_entry_side == "long":
-                    fill_px = _apply_fill_price("long_entry", o, cfg.slippage_side)
-                else:
-                    fill_px = _apply_fill_price("short_entry", o, cfg.slippage_side)
-
+                fill_px = _apply_fill_price("long_entry", o, cfg.slippage_side)
                 fee_entry = equity * float(cfg.fee_taker)
                 equity -= fee_entry
 
-                position = pending_entry_side
-                entry_px = fill_px
+                t["entry_px"] = float(fill_px)
+                t["fee_entry"] = float(fee_entry)
 
-                trades[-1]["entry_px"] = float(fill_px)
-                trades[-1]["fee_entry"] = float(fee_entry)
+                position, entry_px, entry_bar_idx, active_trade_idx = "long", float(fill_px), int(i), trade_idx
 
-                pending_entry_side = None
-                pending_entry_trade_idx = None
+            elif s == "down":
+                trade_idx = _new_trade(ts, "short")
+                t = trades[trade_idx]
+                t["equity_before_entry"] = float(equity)
+                t["entry_ts"] = ts
+                t["entry_raw_px"] = float(o)
+                t["entry_bar_idx"] = int(i)
 
-                # Check stop immediately for this bar
-                if position == "long":
-                    stop_px = entry_px * (1.0 - float(cfg.stop_loss_pct))
-                    if l <= stop_px:
-                        stop_fill = stop_px * (1.0 - float(cfg.slippage_side))
-                        gross_ret = (stop_fill / entry_px) - 1.0
-                        equity *= (1.0 + gross_ret)
-                        fee_exit = equity * float(cfg.fee_taker)
-                        equity -= fee_exit
-                        trades[-1]["exit_ts"] = ts
-                        trades[-1]["exit_px"] = float(stop_fill)
-                        trades[-1]["fee_exit"] = float(fee_exit)
-                        trades[-1]["exit_reason"] = "stop"
-                        position = "flat"
-                        entry_px = None
+                fill_px = _apply_fill_price("short_entry", o, cfg.slippage_side)
+                fee_entry = equity * float(cfg.fee_taker)
+                equity -= fee_entry
 
-                elif position == "short":
-                    stop_px = entry_px * (1.0 + float(cfg.stop_loss_pct))
-                    if h >= stop_px:
-                        stop_fill = stop_px * (1.0 + float(cfg.slippage_side))
-                        gross_ret = (entry_px / stop_fill) - 1.0
-                        equity *= (1.0 + gross_ret)
-                        fee_exit = equity * float(cfg.fee_taker)
-                        equity -= fee_exit
-                        trades[-1]["exit_ts"] = ts
-                        trades[-1]["exit_px"] = float(stop_fill)
-                        trades[-1]["fee_exit"] = float(fee_exit)
-                        trades[-1]["exit_reason"] = "stop"
-                        position = "flat"
-                        entry_px = None
+                t["entry_px"] = float(fill_px)
+                t["fee_entry"] = float(fee_entry)
 
-        else:
-            # FIX 5: Handle last bar exit
-            if position == "long" and s == "down":
-                if can_fill_next:
-                    pending_exit = True
-                else:
-                    # Last bar exit - exit immediately at this bar's open
-                    exit_px = _apply_fill_price("long_exit", o, cfg.slippage_side)
-                    gross_ret = (exit_px / entry_px) - 1.0
-                    equity *= (1.0 + gross_ret)
-                    fee_exit = equity * float(cfg.fee_taker)
-                    equity -= fee_exit
-                    trades[-1]["exit_ts"] = ts
-                    trades[-1]["exit_px"] = float(exit_px)
-                    trades[-1]["fee_exit"] = float(fee_exit)
-                    trades[-1]["exit_reason"] = "signal"
-                    position = "flat"
-                    entry_px = None
+                position, entry_px, entry_bar_idx, active_trade_idx = "short", float(fill_px), int(i), trade_idx
 
-            elif position == "short" and s == "up":
-                if can_fill_next:
-                    pending_exit = True
-                else:
-                    # Last bar exit - exit immediately at this bar's open
-                    exit_px = _apply_fill_price("short_exit", o, cfg.slippage_side)
-                    gross_ret = (entry_px / exit_px) - 1.0
-                    equity *= (1.0 + gross_ret)
-                    fee_exit = equity * float(cfg.fee_taker)
-                    equity -= fee_exit
-                    trades[-1]["exit_ts"] = ts
-                    trades[-1]["exit_px"] = float(exit_px)
-                    trades[-1]["fee_exit"] = float(fee_exit)
-                    trades[-1]["exit_reason"] = "signal"
-                    position = "flat"
-                    entry_px = None
+        if position == "long":
+            stop_px = float(entry_px) * (1.0 - float(cfg.stop_loss_pct))
+            if l <= stop_px:
+                stop_fill = stop_px * (1.0 - float(cfg.slippage_side))
+                gross_ret = (stop_fill / float(entry_px)) - 1.0
+
+                equity *= (1.0 + gross_ret)
+                fee_exit = equity * float(cfg.fee_taker)
+                equity -= fee_exit
+
+                finalize_trade(active_trade_idx, i, ts, stop_px, stop_fill, fee_exit, "stop", gross_ret)
+                position, entry_px, entry_bar_idx, active_trade_idx = "flat", None, None, None
+            exited_this_bar = True
+
+        elif position == "short":
+            stop_px = float(entry_px) * (1.0 + float(cfg.stop_loss_pct))
+            if h >= stop_px:
+                stop_fill = stop_px * (1.0 + float(cfg.slippage_side))
+                gross_ret = (float(entry_px) / stop_fill) - 1.0
+
+                equity *= (1.0 + gross_ret)
+                fee_exit = equity * float(cfg.fee_taker)
+                equity -= fee_exit
+
+                finalize_trade(active_trade_idx, i, ts, stop_px, stop_fill, fee_exit, "stop", gross_ret)
+                position, entry_px, entry_bar_idx, active_trade_idx = "flat", None, None, None
+            exited_this_bar = True
 
         record_equity(ts)
 
@@ -306,8 +230,8 @@ def run_engine(
     equity_df = pd.DataFrame(equity_rows)
 
     if not trades_df.empty:
-        trades_df["entry_ts"] = pd.to_datetime(trades_df["entry_ts"], utc=True)
-        trades_df["exit_ts"] = pd.to_datetime(trades_df["exit_ts"], utc=True)
+        for col in ["decision_ts", "entry_ts", "exit_ts"]:
+            trades_df[col] = pd.to_datetime(trades_df[col], utc=True, errors="coerce")
 
     if not equity_df.empty:
         equity_df["ts"] = pd.to_datetime(equity_df["ts"], utc=True)
@@ -316,18 +240,16 @@ def run_engine(
     final_equity = float(equity_df["equity"].iloc[-1]) if not equity_df.empty else float(cfg.initial_equity)
     total_ret = float(final_equity - float(cfg.initial_equity))
 
-    metrics = {
+    completed = trades_df.dropna(subset=["exit_px"]) if not trades_df.empty else trades_df
+
+    metrics: Dict[str, Any] = {
         "initial_equity": float(cfg.initial_equity),
-        "final_equity": final_equity,
-        "total_return": total_ret,
-        "max_drawdown": max_dd,
+        "final_equity": float(final_equity),
+        "total_return": float(total_ret),
+        "max_drawdown": float(max_dd),
         "num_trades": int(len(trades_df)),
-        "num_wins": int(
-            (
-                ((trades_df["exit_px"] > trades_df["entry_px"]) & (trades_df["side"] == "long")).sum()
-                + ((trades_df["exit_px"] < trades_df["entry_px"]) & (trades_df["side"] == "short")).sum()
-            )
-        ) if not trades_df.empty else 0,
+        "num_completed": int(len(completed)) if not trades_df.empty else 0,
+        "num_wins": int((completed["gross_ret"] > 0).sum()) if not completed.empty else 0,
     }
 
     return trades_df, equity_df, metrics
