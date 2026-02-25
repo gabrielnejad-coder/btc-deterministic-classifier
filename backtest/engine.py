@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -11,6 +11,7 @@ class EngineConfig:
     fee_taker: float
     slippage_side: float
     stop_loss_pct: float
+    hold_min_bars: int
     initial_equity: float
     one_position: bool = True
 
@@ -62,7 +63,9 @@ def run_engine(
         nonlocal peak
         peak = max(peak, equity)
         dd = (peak - equity) / peak if peak > 0 else 0.0
-        equity_rows.append({"ts": ts_val, "equity": float(equity), "peak": float(peak), "drawdown": float(dd)})
+        equity_rows.append(
+            {"ts": ts_val, "equity": float(equity), "peak": float(peak), "drawdown": float(dd)}
+        )
 
     def _new_trade(decision_ts: pd.Timestamp, side: str) -> int:
         trades.append(
@@ -134,8 +137,11 @@ def run_engine(
         l = float(df.loc[i, "low"])
 
         s = str(sig.iloc[i])
+        bars_in_pos = i - entry_bar_idx if entry_bar_idx is not None else 0
+        can_signal_exit = bars_in_pos >= int(cfg.hold_min_bars)
 
-        if position == "long" and s in ("down", "flat"):
+        # A) Signal exits at open[i] (guarded by hold_min_bars)
+        if position == "long" and can_signal_exit and s in ("down", "flat"):
             exit_px = _apply_fill_price("long_exit", o, cfg.slippage_side)
             gross_ret = (exit_px / float(entry_px)) - 1.0
 
@@ -144,11 +150,10 @@ def run_engine(
             equity -= fee_exit
 
             finalize_trade(active_trade_idx, i, ts, o, exit_px, fee_exit, "signal", gross_ret)
-
             position, entry_px, entry_bar_idx, active_trade_idx = "flat", None, None, None
             exited_this_bar = True
 
-        elif position == "short" and s in ("up", "flat"):
+        elif position == "short" and can_signal_exit and s in ("up", "flat"):
             exit_px = _apply_fill_price("short_exit", o, cfg.slippage_side)
             gross_ret = (float(entry_px) / exit_px) - 1.0
 
@@ -157,10 +162,10 @@ def run_engine(
             equity -= fee_exit
 
             finalize_trade(active_trade_idx, i, ts, o, exit_px, fee_exit, "signal", gross_ret)
-
             position, entry_px, entry_bar_idx, active_trade_idx = "flat", None, None, None
             exited_this_bar = True
 
+        # B) Entries at open[i] (only if flat and we did not exit this bar)
         if position == "flat" and (not exited_this_bar):
             if s == "up":
                 trade_idx = _new_trade(ts, "long")
@@ -196,6 +201,7 @@ def run_engine(
 
                 position, entry_px, entry_bar_idx, active_trade_idx = "short", float(fill_px), int(i), trade_idx
 
+        # C) Stops (can exit any time)
         if position == "long":
             stop_px = float(entry_px) * (1.0 - float(cfg.stop_loss_pct))
             if l <= stop_px:
@@ -226,6 +232,27 @@ def run_engine(
 
         record_equity(ts)
 
+
+    # D) Force close any open position at end of data (EOD liquidation)
+    if position in ("long", "short") and entry_px is not None and active_trade_idx is not None:
+        last_i = n - 1
+        last_ts = df.loc[last_i, "ts"]
+        last_close = float(df.loc[last_i, "close"])
+
+        if position == "long":
+            exit_px = _apply_fill_price("long_exit", last_close, cfg.slippage_side)
+            gross_ret = (exit_px / float(entry_px)) - 1.0
+        else:
+            exit_px = _apply_fill_price("short_exit", last_close, cfg.slippage_side)
+            gross_ret = (float(entry_px) / exit_px) - 1.0
+
+        equity *= (1.0 + gross_ret)
+        fee_exit = equity * float(cfg.fee_taker)
+        equity -= fee_exit
+
+        finalize_trade(active_trade_idx, last_i, last_ts, last_close, exit_px, fee_exit, "eod", gross_ret)
+        position, entry_px, entry_bar_idx, active_trade_idx = "flat", None, None, None
+
     trades_df = pd.DataFrame(trades)
     equity_df = pd.DataFrame(equity_rows)
 
@@ -250,6 +277,8 @@ def run_engine(
         "num_trades": int(len(trades_df)),
         "num_completed": int(len(completed)) if not trades_df.empty else 0,
         "num_wins": int((completed["gross_ret"] > 0).sum()) if not completed.empty else 0,
+        "avg_fees": float(completed["fees_total"].mean()) if not completed.empty else 0.0,
+        "total_fees": float(completed["fees_total"].sum()) if not completed.empty else 0.0,
     }
 
     return trades_df, equity_df, metrics
