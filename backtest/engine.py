@@ -11,10 +11,9 @@ class EngineConfig:
     fee_taker: float
     slippage_side: float
     stop_loss_pct: float
-    hold_min_bars: int
     initial_equity: float
+    hold_min_bars: int = 12
     one_position: bool = True
-
 
 def _apply_fill_price(direction: str, raw_price: float, slip: float) -> float:
     if direction == "long_entry":
