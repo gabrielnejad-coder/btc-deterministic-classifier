@@ -24,10 +24,34 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-TRADER = os.environ.get("TRADER", "060").strip()
 _MODULES = {"060": "paper_trader", "050": "paper_trader_050"}
-if TRADER not in _MODULES:
-    raise SystemExit(f"TRADER must be one of {list(_MODULES)}, got {TRADER!r}")
+
+
+def _resolve_trader() -> str:
+    """Which strategy to run. Explicit TRADER env wins; otherwise infer from the
+    Railway service name (auto-injected as RAILWAY_SERVICE_NAME), so no per-service
+    dashboard config is required. Defaults to the frozen 0.60 strategy."""
+    explicit = os.environ.get("TRADER")
+    if explicit and explicit.strip() in _MODULES:
+        return explicit.strip()
+    svc = (os.environ.get("RAILWAY_SERVICE_NAME") or "").lower()
+    if "050" in svc:
+        return "050"
+    return "060"
+
+
+def _resolve_state_root():
+    """Where to persist state/logs. Explicit STATE_ROOT env wins; otherwise
+    auto-use a mounted Railway volume at /data if present; else None (ephemeral)."""
+    root = os.environ.get("STATE_ROOT")
+    if root:
+        return root
+    if os.path.isdir("/data"):
+        return "/data"
+    return None
+
+
+TRADER = _resolve_trader()
 MODULE_NAME = _MODULES[TRADER]
 
 
@@ -40,10 +64,10 @@ def _redirect_state(pt) -> None:
 
     This only reassigns module-level path globals; it does not alter any logic.
     """
-    root = os.environ.get("STATE_ROOT")
+    root = _resolve_state_root()
     if not root:
-        _log(f"STATE_ROOT not set — writing state under {pt.STATE_DIR.resolve()} "
-             f"(EPHEMERAL on Railway; attach a Volume and set STATE_ROOT)")
+        _log(f"no persistent volume found — writing state under {pt.STATE_DIR.resolve()} "
+             f"(EPHEMERAL on Railway; attach a Volume mounted at /data to persist)")
         return
     base = Path(root)
     suffix = "_050" if MODULE_NAME == "paper_trader_050" else ""
