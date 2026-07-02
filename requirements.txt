@@ -1,0 +1,5 @@
+# Runtime deps for the live paper traders (live/paper_trader*.py)
+# Only these two are third-party; everything else the scripts use is stdlib
+# (argparse, json, time, datetime, pathlib, os).
+numpy>=1.26,<3
+requests>=2.31,<3

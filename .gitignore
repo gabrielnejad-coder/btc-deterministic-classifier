@@ -7,3 +7,8 @@ __pycache__/
 
 # artifacts
 reports/
+
+# live trader runtime state + logs (persisted on Railway volume, never committed)
+live/state/
+live/state_050/
+*.log

@@ -1,0 +1,25 @@
+# Keep the Railway build/upload lean — none of this is needed to run the traders.
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.DS_Store
+
+# Large research/data artifacts — not needed at runtime
+data_parquet/
+data_raw/
+reports/
+backtest/
+model/
+features/
+config/
+tests/
+data_scripts/
+
+# Local run logs (Railway captures stdout; persistent state lives on a Volume)
+live/logs/
+live/logs_050/
+live/state/
+live/state_050/
+live/*.log
