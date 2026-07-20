@@ -12,3 +12,6 @@ reports/
 live/state/
 live/state_050/
 *.log
+
+# local dev env (PYTHONPATH etc.)
+.env

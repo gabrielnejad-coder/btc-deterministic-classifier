@@ -3,68 +3,58 @@ from pathlib import Path
 
 import pandas as pd
 
-from backtest.engine import EngineConfig, run_engine
+from backtest.engine import run_engine, EngineConfig
 from backtest.walkforward import split_walkforward
 from model.strategy_v2 import build_signals_v2
+from model.strategy_v2_edge import build_signals_v2_edge
 
 
-def _validate_signals(split_df: pd.DataFrame, signals: pd.Series) -> None:
-    if not isinstance(signals, pd.Series):
-        raise TypeError(f"signals must be pd.Series, got {type(signals)}")
-
-    if not isinstance(signals.index, pd.DatetimeIndex):
-        raise TypeError(f"signals index must be DatetimeIndex, got {type(signals.index)}")
-
-    if signals.index.tz is None:
-        raise ValueError("signals index must be tz-aware (UTC)")
-
-    df_ts = pd.DatetimeIndex(pd.to_datetime(split_df["ts"], utc=True), name="ts")
-
-    if not signals.index.equals(df_ts):
-        raise ValueError("signals index must exactly equal df['ts'] (same values, same order)")
-
-    bad = set(signals.dropna().unique()) - {"up", "down", "flat"}
-    if bad:
-        raise ValueError(f"Unexpected signal values: {bad}")
-
-
-def main():
-    Path("reports").mkdir(parents=True, exist_ok=True)
-
-    df = pd.read_parquet("data_parquet/BTCUSD_USD_1h_20220323_now.parquet")
-    df = df.copy()
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
-    df = df.sort_values("ts")
-
-    cfg = EngineConfig(
+def load_cfg() -> EngineConfig:
+    # Hard aligned with v1 config defaults
+    return EngineConfig(
         fee_taker=0.0004,
         slippage_side=0.0001,
         stop_loss_pct=0.02,
-        initial_equity=1_000.0,
+        hold_min_bars=12,
+        initial_equity=1000.0,
+        one_position=True,
     )
 
+
+def main():
+    df = pd.read_parquet("data_parquet/BTCUSD_USD_1h_20220323_now.parquet").copy()
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df = df.sort_values("ts").reset_index(drop=True)
+
     splits = split_walkforward(df)
+    cfg = load_cfg()
 
     for split_name, split_df in splits.items():
-        print(f"Running {split_name}...")
+        print("\n==============================")
+        print("SPLIT:", split_name)
+        print("==============================")
 
-        signals = build_signals_v2(split_df)
-        _validate_signals(split_df, signals)
+        # ---- Probability policy ----
+        print("\nRunning probability policy...")
+        signals_prob = build_signals_v2(split_df)
+        trades_p, equity_p, metrics_p = run_engine(split_df, signals_prob, cfg)
+        print("prob_metrics:", metrics_p)
 
-        trades, equity, metrics = run_engine(split_df, signals, cfg)
+        # ---- Edge policy ----
+        print("\nRunning edge policy...")
+        signals_edge = build_signals_v2_edge(split_df)
+        trades_e, equity_e, metrics_e = run_engine(split_df, signals_edge, cfg)
+        print("edge_metrics:", metrics_e)
 
-        with open(f"reports/v2_{split_name}_metrics.json", "w") as f:
-            json.dump(metrics, f, indent=2)
-
-        trades.to_parquet(f"reports/v2_{split_name}_trades.parquet", index=False)
-        equity.to_parquet(f"reports/v2_{split_name}_equity.parquet", index=False)
-
-        print(
-            f"  {split_name}: trades={metrics['num_trades']}, "
-            f"return={metrics['total_return']:.2f}, dd={metrics['max_drawdown']:.4f}"
-        )
-
-    print("done")
+        print("\n------------------------------")
+        print("Summary for", split_name)
+        print("Prob final_equity:", metrics_p["final_equity"])
+        print("Edge final_equity:", metrics_e["final_equity"])
+        print("Prob max_dd:", metrics_p["max_drawdown"])
+        print("Edge max_dd:", metrics_e["max_drawdown"])
+        print("Prob trades:", metrics_p["num_trades"])
+        print("Edge trades:", metrics_e["num_trades"])
+        print("------------------------------\n")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,280 @@
+"""
+Positioning Pressure Experiment — Pack V2.
+
+Same pipeline as 24h horizon experiment but with 32 features
+including positioning pressure proxies.
+
+Hypothesis: funding acceleration + price stress features capture
+forced flow dynamics that improve OOS edge.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from scipy.stats import spearmanr
+
+from backtest.engine import EngineConfig, run_engine
+from backtest.walkforward import split_walkforward
+from features.packs.pack_v2_positioning import build_features_pack_v2, FEATURE_NAMES_PACK_V2
+
+
+REPORTS_DIR = Path("reports/positioning_v2")
+DATA_DIR = Path("data_parquet")
+
+ENGINE_CFG = EngineConfig(
+    fee_taker=0.0004, slippage_side=0.0001, stop_loss_pct=0.02,
+    hold_min_bars=24, initial_equity=1000.0, one_position=True,
+)
+
+GBDT_PARAMS = dict(
+    max_iter=300, max_depth=4, learning_rate=0.05,
+    min_samples_leaf=50, max_leaf_nodes=31,
+    l2_regularization=1.0, random_state=42,
+)
+
+FEAT_NAMES = FEATURE_NAMES_PACK_V2
+LABEL_HORIZON = 24
+LABEL_THRESHOLD = 0.004
+TRAIN_MONTHS = 12
+RETRAIN_MONTHS = 1
+VAL_MONTHS = 1
+TEST_MONTHS = 1
+GAP_BARS = 24
+MAX_DD = 0.10
+THRESHOLD_GRID = np.round(np.arange(0.42, 0.58, 0.01), 2)
+MIN_TRADES_VAL = 3
+
+
+def _build_signals(ts, p_up, thr):
+    idx = pd.DatetimeIndex(pd.to_datetime(ts.values, utc=True), name="ts")
+    return pd.Series(np.where(p_up >= thr, "up", "flat"), index=idx, dtype="object")
+
+
+def _train_model(X, y):
+    if not isinstance(y, np.ndarray):
+        y = np.array(y)
+    clf = HistGradientBoostingClassifier(**GBDT_PARAMS)
+    clf.fit(X, y)
+    cal = CalibratedClassifierCV(clf, cv=3, method="isotonic")
+    cal.fit(X, y)
+    return cal
+
+
+def _p_up(model, X):
+    classes = list(model.classes_)
+    return model.predict_proba(X)[:, classes.index("up")]
+
+
+def _months_range(start_ts, end_ts):
+    cursor = start_ts + pd.DateOffset(months=TRAIN_MONTHS)
+    while cursor < end_ts:
+        w = {
+            "train_start": cursor - pd.DateOffset(months=TRAIN_MONTHS),
+            "train_end": cursor,
+            "val_start": cursor + pd.Timedelta(hours=GAP_BARS),
+            "val_end": cursor + pd.DateOffset(months=VAL_MONTHS),
+            "test_start": cursor + pd.DateOffset(months=VAL_MONTHS),
+            "test_end": cursor + pd.DateOffset(months=VAL_MONTHS + TEST_MONTHS),
+        }
+        if w["test_start"] >= end_ts:
+            break
+        w["test_end"] = min(w["test_end"], end_ts)
+        yield w
+        cursor += pd.DateOffset(months=RETRAIN_MONTHS)
+
+
+def _slice(df, s, e):
+    return df[(df["ts"] >= s) & (df["ts"] < e)].copy().reset_index(drop=True)
+
+
+def main() -> None:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    btc = pd.read_parquet(DATA_DIR / "BTCUSD_USD_1h_20220323_now.parquet").copy()
+    eth = pd.read_parquet(DATA_DIR / "ETH_1h.parquet").copy()
+    sol = pd.read_parquet(DATA_DIR / "SOL_1h.parquet").copy()
+    btc["ts"] = pd.to_datetime(btc["ts"], utc=True)
+    btc = btc.sort_values("ts").reset_index(drop=True)
+
+    print(f"Building features ({len(FEAT_NAMES)} total)...")
+    all_feats = build_features_pack_v2(btc, eth, sol)
+    all_feats = all_feats.dropna(subset=FEAT_NAMES).reset_index(drop=True)
+
+    # Labels
+    btc_idx = btc.set_index("ts").sort_index()
+    close_a = btc_idx["close"].reindex(all_feats["ts"]).values
+    fwd = pd.Series(close_a).shift(-LABEL_HORIZON) / pd.Series(close_a) - 1.0
+    labels = pd.Series("flat", index=all_feats.index, dtype="object")
+    labels[fwd > LABEL_THRESHOLD] = "up"
+    labels[fwd < -LABEL_THRESHOLD] = "down"
+    labels[fwd.isna()] = None
+    all_feats["label"] = labels.values
+
+    print(f"POSITIONING V2 EXPERIMENT (24h horizon)")
+    print(f"  features: {len(FEAT_NAMES)} (10 new positioning proxies)")
+    print(f"  rows: {len(all_feats)}")
+
+    # ── Calibration ──────────────────────────────────────────────────
+    splits = split_walkforward(btc)
+    train_btc = splits["train"]
+    tr_f = all_feats[
+        (all_feats["ts"] >= train_btc["ts"].min()) &
+        (all_feats["ts"] <= train_btc["ts"].max())
+    ].dropna(subset=["label", *FEAT_NAMES]).reset_index(drop=True)
+
+    X_tr = tr_f[FEAT_NAMES].astype(float).values
+    y_tr = np.array(tr_f["label"].values)
+    model = _train_model(X_tr, y_tr)
+
+    p_tr = _p_up(model, X_tr)
+    close_tr = btc_idx["close"].reindex(pd.to_datetime(tr_f["ts"].values, utc=True))
+    fwd_tr = (close_tr.shift(-LABEL_HORIZON) / close_tr - 1.0).values
+    cal = pd.DataFrame({"p_up": p_tr, "fwd": fwd_tr}).dropna()
+    cal["dec"] = pd.qcut(cal["p_up"], 10, labels=False, duplicates="drop")
+
+    print(f"\n  CALIBRATION (train, {len(cal)} rows)")
+    print(f"  {'d':>3s} {'p_lo':>7s} {'p_hi':>7s} {'ret':>9s} {'hit':>6s}")
+    for d in sorted(cal["dec"].unique()):
+        s = cal[cal["dec"] == d]
+        print(f"  {d:>3d} {s['p_up'].min():>7.4f} {s['p_up'].max():>7.4f} "
+              f"{s['fwd'].mean():>9.5f} {(s['fwd']>0).mean():>6.3f}")
+
+    rho, pv = spearmanr(cal["p_up"], cal["fwd"])
+    avgs = [cal[cal["dec"]==d]["fwd"].mean() for d in sorted(cal["dec"].unique())]
+    mono = sum(1 for j in range(1, len(avgs)) if avgs[j] > avgs[j-1]) / max(len(avgs)-1, 1)
+    spread = avgs[-1] - avgs[0]
+    print(f"\n  Spearman: {rho:.4f}  Mono: {mono:.2f}  Spread: {spread:+.5f}")
+    print(f"  (24h baseline: rho=0.6974, mono=0.89, spread=+0.06221)")
+
+    # ── Adaptive walkforward ─────────────────────────────────────────
+    windows = list(_months_range(btc["ts"].min(), btc["ts"].max()))
+    print(f"\n  WALKFORWARD ({len(windows)} windows)")
+
+    results = []
+    for i, w in enumerate(windows):
+        tr = all_feats[(all_feats["ts"] >= w["train_start"]) & (all_feats["ts"] < w["train_end"])]
+        tr = tr.dropna(subset=["label", *FEAT_NAMES]).reset_index(drop=True)
+        if len(tr) < 500:
+            results.append({"window": i, "status": "skip"})
+            continue
+
+        mdl = _train_model(tr[FEAT_NAMES].values, np.array(tr["label"].values))
+
+        vb = _slice(btc, w["val_start"], w["val_end"])
+        vf = all_feats[(all_feats["ts"] >= w["val_start"]) & (all_feats["ts"] < w["val_end"])]
+        vf = vf.dropna(subset=FEAT_NAMES).reset_index(drop=True)
+        if len(vf) < 30 or len(vb) < 30:
+            results.append({"window": i, "status": "skip"})
+            continue
+
+        pv_ = _p_up(mdl, vf[FEAT_NAMES].values)
+        bt, be = None, 0
+        for thr in THRESHOLD_GRID:
+            sig = _build_signals(vf["ts"], pv_, float(thr))
+            _, _, m = run_engine(vb, sig, ENGINE_CFG)
+            if m["max_drawdown"] <= MAX_DD and m["num_trades"] >= MIN_TRADES_VAL:
+                if m["final_equity"] > be:
+                    be, bt = m["final_equity"], float(thr)
+
+        if bt is None:
+            results.append({"window": i, "status": "no_thr",
+                            "test_start": str(w["test_start"].date()),
+                            "test_end": str(w["test_end"].date())})
+            continue
+
+        tb = _slice(btc, w["test_start"], w["test_end"])
+        tf = all_feats[(all_feats["ts"] >= w["test_start"]) & (all_feats["ts"] < w["test_end"])]
+        tf = tf.dropna(subset=FEAT_NAMES).reset_index(drop=True)
+        if len(tf) < 10 or len(tb) < 10:
+            results.append({"window": i, "status": "skip"})
+            continue
+
+        pt = _p_up(mdl, tf[FEAT_NAMES].values)
+        st = _build_signals(tf["ts"], pt, bt)
+        _, _, met = run_engine(tb, st, ENGINE_CFG)
+
+        us = pd.Series("up", index=pd.DatetimeIndex(
+            pd.to_datetime(tb["ts"].values, utc=True)), dtype="object")
+        _, _, bm = run_engine(tb, us, ENGINE_CFG)
+
+        dok = met["max_drawdown"] <= MAX_DD
+        beats = met["final_equity"] > bm["final_equity"]
+        real = met["num_trades"] >= 3
+        status = "PASS" if (dok and beats and real) else ("HOLLOW" if (dok and not real) else "FAIL")
+
+        results.append({
+            "window": i,
+            "test_start": str(w["test_start"].date()),
+            "test_end": str(w["test_end"].date()),
+            "threshold": bt,
+            "equity": met["final_equity"],
+            "ret": met["total_return"],
+            "dd": met["max_drawdown"],
+            "trades": met["num_trades"],
+            "wins": met["num_wins"],
+            "baseline_eq": bm["final_equity"],
+            "status": status,
+        })
+
+    # ── Summary ──────────────────────────────────────────────────────
+    print(f"\n{'='*75}")
+    print(f"  {'W':>3s} {'period':>25s} {'thr':>5s} {'eq':>8s} {'ret':>8s} {'dd':>6s} {'tr':>4s} {'w':>3s} {'gate':>8s}")
+    print(f"  {'-'*3} {'-'*25} {'-'*5} {'-'*8} {'-'*8} {'-'*6} {'-'*4} {'-'*3} {'-'*8}")
+
+    np_ = nf = nh = ns = 0
+    pr = []
+    ar = []
+    for r in results:
+        if "equity" not in r:
+            ns += 1
+            ts = r.get("test_start", "?")
+            te = r.get("test_end", "?")
+            print(f"  {r['window']:>3d} {(ts+'->'+te):>25s}   ---      ---      ---    ---  --- {r['status']:>8s}")
+        else:
+            p = f"{r['test_start']}->{r['test_end']}"
+            print(f"  {r['window']:>3d} {p:>25s} {r['threshold']:>5.2f} "
+                  f"${r['equity']:>7.0f} ${r['ret']:>7.0f} {r['dd']:>5.3f} "
+                  f"{r['trades']:>4d} {r['wins']:>3d} {r['status']:>8s}")
+            ar.append(r["ret"])
+            if r["status"] == "PASS":
+                np_ += 1
+                pr.append(r["ret"])
+            elif r["status"] == "HOLLOW":
+                nh += 1
+            else:
+                nf += 1
+
+    avg_p = np.mean(pr) if pr else 0
+    avg_a = np.mean(ar) if ar else 0
+    total = sum(ar)
+
+    print(f"\n  PASS: {np_}  HOLLOW: {nh}  FAIL: {nf}  SKIP: {ns}")
+    print(f"  avg PASS ret: ${avg_p:.2f}  avg ALL ret: ${avg_a:.2f}  total P&L: ${total:.2f}")
+
+    print(f"\n  COMPARISON:")
+    print(f"    24h pack_v1 (wide):  PASS=19  FAIL=9   avg_all=$-12.13  total=$-412")
+    print(f"    24h pack_v1 (tight): PASS=17  FAIL=6   avg_all=$-10.96  total=$-307")
+    print(f"    24h pack_v2 (pos):   PASS={np_}  FAIL={nf}   avg_all=${avg_a:.2f}  total=${total:.2f}")
+
+    if total > 0:
+        print(f"\n  VERDICT: POSITIONING FEATURES FLIPPED PROFITABILITY.")
+    elif avg_a > -5:
+        print(f"\n  VERDICT: IMPROVED. Near breakeven. Worth further investigation.")
+    elif np_ > 19:
+        print(f"\n  VERDICT: MORE STABLE but still not profitable.")
+    else:
+        print(f"\n  VERDICT: POSITIONING PROXIES DID NOT HELP.")
+        print(f"  Directional classification at retail costs is structurally weak.")
+    print(f"{'='*75}")
+
+    Path(REPORTS_DIR / "results.json").write_text(json.dumps(results, indent=2, default=str) + "\n")
+    print(f"  WROTE {REPORTS_DIR}/results.json")
+
+
+if __name__ == "__main__":
+    main()

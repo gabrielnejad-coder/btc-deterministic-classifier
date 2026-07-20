@@ -1,0 +1,10 @@
+{"action": "open", "ts": "2026-03-23T14:00:00+00:00", "signal_price": 71656.03, "entry_price": 71663.195603, "equity_before": 1000.0}
+{"action": "close", "reason": "EXIT", "entry_ts": "2026-03-23T14:00:00+00:00", "exit_ts": "2026-03-23T20:00:00+00:00", "entry_price": 71663.195603, "exit_price": 70583.42, "bars_held": 3, "gross_pnl": -15.16, "net_pnl": -15.56, "equity_after": 984.04}
+{"action": "open", "ts": "2026-04-07T20:00:00+00:00", "signal_price": 69343.24, "entry_price": 69350.174324, "equity_before": 984.04}
+{"action": "close", "reason": "EXIT", "entry_ts": "2026-04-07T20:00:00+00:00", "exit_ts": "2026-04-07T23:00:00+00:00", "entry_price": 69350.174324, "exit_price": 71442.56, "bars_held": 3, "gross_pnl": 29.58, "net_pnl": 29.18, "equity_after": 1012.83}
+{"action": "open", "ts": "2026-05-11T16:00:00+00:00", "signal_price": 81488.41, "entry_price": 81496.558841, "equity_before": 1012.83}
+{"action": "close", "reason": "EXIT", "entry_ts": "2026-05-11T16:00:00+00:00", "exit_ts": "2026-05-12T15:00:00+00:00", "entry_price": 81496.558841, "exit_price": 80462.35, "bars_held": 3, "gross_pnl": -12.95, "net_pnl": -13.35, "equity_after": 999.07}
+{"action": "open", "ts": "2026-05-30T14:00:00+00:00", "signal_price": 73763.6, "entry_price": 73770.97636, "equity_before": 999.07}
+{"action": "close", "reason": "EXIT", "entry_ts": "2026-05-30T14:00:00+00:00", "exit_ts": "2026-05-31T00:00:00+00:00", "entry_price": 73770.97636, "exit_price": 73774.56, "bars_held": 3, "gross_pnl": -0.05, "net_pnl": -0.45, "equity_after": 998.22}
+{"action": "open", "ts": "2026-07-09T06:00:00+00:00", "signal_price": 62653.4, "entry_price": 62659.66534, "equity_before": 998.22}
+{"action": "close", "reason": "EXIT", "entry_ts": "2026-07-09T06:00:00+00:00", "exit_ts": "2026-07-09T09:00:00+00:00", "entry_price": 62659.66534, "exit_price": 62857.1, "bars_held": 3, "gross_pnl": 3.04, "net_pnl": 2.64, "equity_after": 1000.47}

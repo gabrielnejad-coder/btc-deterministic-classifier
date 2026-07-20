@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict
+
+import numpy as np
+import pandas as pd
+
+from backtest.walkforward import split_walkforward
+from features.build_features_leaders_v1 import build_features_leaders_v1
+from model.classifier_v3 import load_v3, predict_proba_df
+from backtest.engine_runner import run_signals_through_engine
+
+
+THRESHOLDS_PATH = Path("reports/v3_policy_thresholds.json")
+
+
+def _load_thresholds() -> Dict[str, float]:
+    if THRESHOLDS_PATH.exists():
+        d = json.loads(THRESHOLDS_PATH.read_text())
+        return {"trade_threshold": float(d["trade_threshold"]), "flip_threshold": float(d["flip_threshold"])}
+    return {"trade_threshold": 0.60, "flip_threshold": 0.65}
+
+
+def _build_signals_from_probs(
+    ts: pd.Series,
+    p_down: np.ndarray,
+    p_flat: np.ndarray,
+    p_up: np.ndarray,
+    trade_threshold: float,
+    flip_threshold: float,
+) -> pd.DataFrame:
+    thr = trade_th
+    want = np.where(P["p_up"].to_numpy() >= thr, "long", "flat")
+
+
+    return pd.DataFrame({"ts": ts, "signal": want})
+
+
+def _run_split(
+    name: str,
+    btc_split: pd.DataFrame,
+    eth: pd.DataFrame,
+    sol: pd.DataFrame,
+    trade_th: float,
+    flip_th: float,
+) -> None:
+    feats = build_features_leaders_v1(btc_split, eth, sol)
+    feats = feats.dropna().reset_index(drop=True)
+
+    m = load_v3()
+    P = predict_proba_df(m, feats)
+
+    sig = _build_signals_from_probs(
+        ts=feats["ts"],
+        p_down=P["p_down"].to_numpy(),
+        p_flat=P["p_flat"].to_numpy(),
+        p_up=P["p_up"].to_numpy(),
+        trade_threshold=trade_th,
+        flip_threshold=flip_th,
+    )
+
+    metrics = run_signals_through_engine(
+        bars=btc_split,
+        signals=sig,
+        policy_name="v3_prob",
+        trade_threshold=trade_th,
+        flip_threshold=flip_th,
+        initial_equity=1000.0,
+    )
+
+    print(f"Running {name}...")
+    print(f"  {name}: trades={metrics['num_trades']}, return={metrics['total_return']:.2f}, dd={metrics['max_drawdown']:.4f}")
+
+
+def main() -> None:
+    btc = pd.read_parquet("data_parquet/BTCUSD_USD_1h_20220323_now.parquet").copy()
+    eth = pd.read_parquet("data_parquet/ETH_1h.parquet").copy()
+    sol = pd.read_parquet("data_parquet/SOL_1h.parquet").copy()
+
+    btc["ts"] = pd.to_datetime(btc["ts"], utc=True)
+    btc = btc.sort_values("ts").reset_index(drop=True)
+
+    splits = split_walkforward(btc)
+    th = _load_thresholds()
+
+    print("USING_V3_POLICY_THRESHOLDS")
+    print(json.dumps(th, indent=2))
+
+    _run_split("train", splits["train"].copy().reset_index(drop=True), eth, sol, th["trade_threshold"], th["flip_threshold"])
+    _run_split("validate", splits["validate"].copy().reset_index(drop=True), eth, sol, th["trade_threshold"], th["flip_threshold"])
+    _run_split("test", splits["test"].copy().reset_index(drop=True), eth, sol, th["trade_threshold"], th["flip_threshold"])
+
+
+if __name__ == "__main__":
+    main()
