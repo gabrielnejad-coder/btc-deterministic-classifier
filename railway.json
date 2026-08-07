@@ -1,7 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "startCommand": "python -u live/runner.py",
-    "restartPolicyType": "ALWAYS"
+    "startCommand": "echo 'Traders paused. To resume: restore startCommand to \"python -u live/runner.py\" and restartPolicyType to \"ALWAYS\" (git revert this commit), then push.' && exit 0",
+    "restartPolicyType": "NEVER"
   }
 }
